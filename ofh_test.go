@@ -46,7 +46,6 @@ func TestSubmitDoesNotLeaveFileHandlesOpen001(t *testing.T) {
 			panic(err)
 		}
 		sub.SubmitJobGetReply(j)
-
 		middleOFH := OpenFiles(childpid)
 
 		// test doing a bunch of submits
@@ -77,7 +76,6 @@ func TestSubmitDoesNotLeaveFileHandlesOpen001(t *testing.T) {
 			sub2.SubmitJobGetReply(j)
 			sub2.Bye()
 		}
-		//		time.Sleep(10 *time.Second)
 		mid2OFH = OpenFiles(childpid)
 
 		sub3, err := NewSubmitter(GenAddress(), cfg, false)
