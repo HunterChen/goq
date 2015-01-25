@@ -186,7 +186,7 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 
 	// add addresses and sockets if not created already
 	if j.Workeraddr != "" {
-		if _, ok := js.Who[j.Workeraddr]; !ok { // bug? this !ok should be ok, right, to actually do a delete.
+		if _, ok := js.Who[j.Workeraddr]; ok {
 			if c, found := js.Who[j.Workeraddr]; found {
 				c.PushSock.Close()
 				delete(js.Who, j.Workeraddr)
@@ -195,7 +195,7 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 	}
 
 	if j.Submitaddr != "" {
-		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, right?
+		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, but ok causes hangs in TestCancelJobInProgress
 			if c, found := js.Who[j.Submitaddr]; found {
 				c.PushSock.Close()
 				delete(js.Who, j.Submitaddr)
