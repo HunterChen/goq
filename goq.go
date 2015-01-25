@@ -256,6 +256,9 @@ func (js *JobServ) FinishersToNewSocket(j *Job) []*nn.Socket {
 }
 
 func (js *JobServ) CloseRegistry() {
+	js.WhoLock.Lock()
+	defer js.WhoLock.Unlock()
+
 	for _, pp := range js.Who {
 		if pp.pushSock != nil {
 			pp.Close()
