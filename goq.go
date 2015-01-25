@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	nn "github.com/glycerine/go-nanomsg"
@@ -180,10 +181,12 @@ func (js *JobServ) RegisterWho(j *Job) {
 }
 
 func (js *JobServ) UnRegisterWho(j *Job) {
+	js.WhoLock.Lock()
+	defer js.WhoLock.Unlock()
 
 	// add addresses and sockets if not created already
 	if j.Workeraddr != "" {
-		if _, ok := js.Who[j.Workeraddr]; !ok {
+		if _, ok := js.Who[j.Workeraddr]; !ok { // bug? this !ok should be ok, right, to actually do a delete.
 			if c, found := js.Who[j.Workeraddr]; found {
 				c.PushSock.Close()
 				delete(js.Who, j.Workeraddr)
@@ -192,7 +195,7 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 	}
 
 	if j.Submitaddr != "" {
-		if _, ok := js.Who[j.Submitaddr]; !ok {
+		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, right?
 			if c, found := js.Who[j.Submitaddr]; found {
 				c.PushSock.Close()
 				delete(js.Who, j.Submitaddr)
@@ -200,6 +203,20 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 		}
 	}
 
+}
+
+func (js *JobServ) UnRegisterSubmitter(j *Job) {
+	if false {
+		js.WhoLock.Lock()
+		defer js.WhoLock.Unlock()
+
+		if j.Submitaddr != "" {
+			if c, found := js.Who[j.Submitaddr]; found {
+				c.PushSock.Close()
+				delete(js.Who, j.Submitaddr)
+			}
+		}
+	}
 }
 
 // assume these won't be long running finishers, so don't cache them in Who
@@ -353,7 +370,8 @@ type JobServ struct {
 	FirstCancelDone chan bool // server closes this after hearing on RunDone a job with .Cancelled set.
 
 	// directory of submitters and workers
-	Who map[string]*PushCache
+	Who     map[string]*PushCache
+	WhoLock sync.RWMutex
 
 	// Finishers : who wants to be notified when a job is done.
 	Finishers map[int64][]Address
@@ -629,6 +647,10 @@ func (js *JobServ) Start() {
 				// we just dispatched, now reply to submitter with ack (in an async goroutine); they don't need to
 				// wait for it, but often they will want confirmation/the jobid.
 				js.AckBack(newjob, newjob.Submitaddr, schema.JOBMSG_ACKSUBMIT, []string{})
+
+				// Generally try to not cache submitter sockets anymore, since they leak
+				// really quickly, filling up all slots in our file descriptor table.
+				js.UnRegisterSubmitter(newjob)
 
 			case resubId := <-js.ReSubmit:
 				VPrintf("  === event loop case === (%d) JobServ got resub for jobid %d\n", loopcount, resubId)
@@ -992,8 +1014,10 @@ func (js *JobServ) AssembleSnapShot() []string {
 		out = append(out, fmt.Sprintf("work %06d   WaitingWorker = '%s'", i, v.Workeraddr))
 	}
 
-	for i, v := range js.KnownJobHash {
-		out = append(out, fmt.Sprintf("KnownJobHash key=%v    value.Msg=%s", i, v.Msg))
+	if Verbose {
+		for i, v := range js.KnownJobHash {
+			out = append(out, fmt.Sprintf("KnownJobHash key=%v    value.Msg=%s", i, v.Msg))
+		}
 	}
 
 	return out
@@ -1022,6 +1046,8 @@ func runningTimeString(j *Job) string {
 // SetAddrDestSocket: note that reqjob should be treated as
 // immutable (read-only) here.
 func (js *JobServ) SetAddrDestSocket(destAddr string, job *Job) {
+	js.WhoLock.RLock()
+	defer js.WhoLock.RUnlock()
 	dest, ok := js.Who[destAddr]
 	if ok {
 		job.DestinationSocket = dest.PushSock
@@ -1135,11 +1161,15 @@ func (js *JobServ) AckBack(reqjob *Job, toaddr string, msg schema.JobMsg, out []
 			if err != nil {
 				// for now assume deaf worker
 				TSPrintf("[pid %d] AckBack with msg %s to '%s' timed-out.\n", os.Getpid(), job.Msg, addr)
+				// close socket, to try not to leak it.
+				js.UnRegisterSubmitter(&job)
 			}
 			return
 		}(*job, toaddr)
 	} else {
 		TSPrintf("[pid %d] hmmm... jobserv could not find desination for final reply to addr: '%s'. Job: %#v\n", os.Getpid(), toaddr, job)
+		// close socket, to try not to leak it.
+		js.UnRegisterSubmitter(job)
 	}
 }
 
@@ -1362,7 +1392,7 @@ func recvZjob(nnzbus *nn.Socket, cfg *Config) (job *Job, err error) {
 	defer func() {
 		if recover() != nil {
 			job = nil
-			err = fmt.Errorf("unknonw recovered error on receive")
+			err = fmt.Errorf("unknown recovered error on receive")
 		}
 	}()
 
