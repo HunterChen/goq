@@ -107,7 +107,8 @@ func (p *PushCache) DemandPushSock() *nn.Socket {
 }
 
 func (p *PushCache) Close() {
-	p.pushSock.SetLinger(10 * time.Second)
+	// SetLinger is essential or else cancel and immo tests which need submit-replies will fail.
+	p.pushSock.SetLinger(2 * time.Second)
 	p.pushSock.Close()
 	p.pushSock = nil
 }
@@ -152,7 +153,7 @@ type Job struct {
 
 	// not serialized, just used
 	// for routing
-	DestinationSocket *nn.Socket
+	destinationSock *nn.Socket
 
 	Runinshell bool
 }
@@ -185,6 +186,8 @@ func (js *JobServ) NewJobId() int64 {
 }
 
 func (js *JobServ) RegisterWho(j *Job) {
+	js.WhoLock.Lock()
+	defer js.WhoLock.Unlock()
 
 	// add addresses and sockets if not created already
 	if j.Workeraddr != "" {
@@ -214,11 +217,9 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 	}
 
 	if j.Submitaddr != "" {
-		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, but ok causes hangs in TestCancelJobInProgress.
-			if c, found := js.Who[j.Submitaddr]; found {
-				c.Close()
-				delete(js.Who, j.Submitaddr)
-			}
+		if c, found := js.Who[j.Submitaddr]; found {
+			c.Close()
+			delete(js.Who, j.Submitaddr)
 		}
 	}
 
@@ -806,7 +807,7 @@ func (js *JobServ) Start() {
 			case snapreq := <-js.SnapRequest:
 				js.RegisterWho(snapreq)
 				js.AckBack(snapreq, snapreq.Submitaddr, schema.JOBMSG_ACKTAKESNAPSHOT, js.AssembleSnapShot())
-				js.UnRegisterWho(snapreq)
+				//js.UnRegisterWho(snapreq) // breaks cancel_test
 
 			case canreq := <-js.Cancel:
 				var j *Job
@@ -836,7 +837,7 @@ func (js *JobServ) Start() {
 
 				js.AckBack(canreq, canreq.Submitaddr, schema.JOBMSG_ACKCANCELSUBMIT, []string{})
 			unreg:
-				js.UnRegisterWho(canreq)
+				//js.UnRegisterWho(canreq) // ackback should take care of this now, right?
 				TSPrintf("**** [jobserver pid %d] server cancelled job %d per request of '%s'.\n", js.Pid, canid, canreq.Submitaddr)
 
 			case obsreq := <-js.ObserveFinish:
@@ -867,7 +868,7 @@ func (js *JobServ) Start() {
 				js.RegisterWho(immoreq)
 				js.ImmolateWorkers(immoreq)
 				js.AckBack(immoreq, immoreq.Submitaddr, schema.JOBMSG_IMMOLATEACK, []string{})
-				js.UnRegisterWho(immoreq)
+				//js.UnRegisterWho(immoreq) // breaks immo_test
 
 			case wd := <-js.WorkerDead:
 				delete(js.DedupWorkerHash, wd.Workeraddr)
@@ -1063,7 +1064,7 @@ func (js *JobServ) SetAddrDestSocket(destAddr string, job *Job) {
 	defer js.WhoLock.RUnlock()
 	dest, ok := js.Who[destAddr]
 	if ok {
-		job.DestinationSocket = dest.DemandPushSock()
+		job.destinationSock = dest.DemandPushSock()
 	}
 }
 
@@ -1090,11 +1091,11 @@ func (js *JobServ) DispatchJobToWorker(reqjob, job *Job) {
 	TSPrintf("**** [jobserver pid %d] dispatching job %d to worker '%s'.\n", js.Pid, job.Id, reqjob.Workeraddr)
 
 	// try to send, give worker 30 seconds to grab it.
-	if job.DestinationSocket != nil {
+	if job.destinationSock != nil {
 		go func(job Job) { // by value, so we can read without any race
 			// we can send, go for it. But be on the lookout for timeout, i.e. when worker dies
 			// before receiving their job. Then we should just re-queue it.
-			_, err := sendZjob(job.DestinationSocket, &job, &js.Cfg)
+			_, err := sendZjob(job.destinationSock, &job, &js.Cfg)
 			if err != nil {
 				// for now assume deaf worker
 				VPrintf("[pid %d] Got error back trying to dispatch job %d to worker '%s'. Incrementing "+
@@ -1167,10 +1168,10 @@ func (js *JobServ) AckBack(reqjob *Job, toaddr string, msg schema.JobMsg, out []
 	job.Workeraddr = reqjob.Workeraddr
 
 	// try to send, give badsig sender
-	if job.DestinationSocket != nil {
+	if job.destinationSock != nil {
 		go func(job Job, addr string) {
 			// doesn't matter if it times out, and it prob will.
-			_, err := sendZjob(job.DestinationSocket, &job, &js.Cfg)
+			_, err := sendZjob(job.destinationSock, &job, &js.Cfg)
 			if err != nil {
 				// for now assume deaf worker
 				TSPrintf("[pid %d] AckBack with msg %s to '%s' timed-out.\n", os.Getpid(), job.Msg, addr)
@@ -1197,11 +1198,11 @@ func (js *JobServ) DispatchShutdownWorker(immojob, workerready *Job) {
 	TSPrintf("**** [jobserver pid %d] sending 'shutdownworker' to worker '%s'.\n", js.Pid, j.Workeraddr)
 
 	// try to send, give worker 30 seconds to grab it.
-	if j.DestinationSocket == nil {
+	if j.destinationSock == nil {
 		panic("trying to immo, but j.DesinationSocket was nil?!?")
 	}
 	go func(job Job) { // by value, so we can read without any race
-		_, err := sendZjob(job.DestinationSocket, &job, &js.Cfg)
+		_, err := sendZjob(job.destinationSock, &job, &js.Cfg)
 		if err != nil {
 			// ignore
 		} else {
