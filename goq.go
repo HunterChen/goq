@@ -72,13 +72,15 @@ type PushCache struct {
 	Name string
 
 	Addr     string     // even port number (mnemonic: stdout is 0/even)
-	PushSock *nn.Socket // from => pull
+	pushSock *nn.Socket // from => pull
+	cfg      *Config
 }
 
 func NewPushCache(name, addr string, cfg *Config) *PushCache {
 	p := &PushCache{
 		Name: name,
 		Addr: addr,
+		cfg:  cfg,
 	}
 
 	t, err := MkPushNN(addr, cfg, false)
@@ -86,9 +88,28 @@ func NewPushCache(name, addr string, cfg *Config) *PushCache {
 		panic(err) // panic: too many open files here.
 	}
 
-	p.PushSock = t
+	p.pushSock = t
 
 	return p
+}
+
+// re-create socket on-demand. Used because we may close
+// sockets to keep from using too many.
+func (p *PushCache) DemandPushSock() *nn.Socket {
+	if p.pushSock == nil {
+		t, err := MkPushNN(p.Addr, p.cfg, false)
+		if err != nil {
+			panic(err) // panic: too many open files here.
+		}
+		p.pushSock = t
+	}
+	return p.pushSock
+}
+
+func (p *PushCache) Close() {
+	p.pushSock.SetLinger(10 * time.Second)
+	p.pushSock.Close()
+	p.pushSock = nil
 }
 
 // Job represents a job to perform, and is our universal message type.
@@ -186,18 +207,16 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 
 	// add addresses and sockets if not created already
 	if j.Workeraddr != "" {
-		if _, ok := js.Who[j.Workeraddr]; ok {
-			if c, found := js.Who[j.Workeraddr]; found {
-				c.PushSock.Close()
-				delete(js.Who, j.Workeraddr)
-			}
+		if c, found := js.Who[j.Workeraddr]; found {
+			c.Close()
+			delete(js.Who, j.Workeraddr)
 		}
 	}
 
 	if j.Submitaddr != "" {
-		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, but ok causes hangs in TestCancelJobInProgress
+		if _, ok := js.Who[j.Submitaddr]; !ok { // bug? this !ok should be ok, but ok causes hangs in TestCancelJobInProgress.
 			if c, found := js.Who[j.Submitaddr]; found {
-				c.PushSock.Close()
+				c.Close()
 				delete(js.Who, j.Submitaddr)
 			}
 		}
@@ -206,15 +225,13 @@ func (js *JobServ) UnRegisterWho(j *Job) {
 }
 
 func (js *JobServ) UnRegisterSubmitter(j *Job) {
-	if false {
-		js.WhoLock.Lock()
-		defer js.WhoLock.Unlock()
+	js.WhoLock.Lock()
+	defer js.WhoLock.Unlock()
 
-		if j.Submitaddr != "" {
-			if c, found := js.Who[j.Submitaddr]; found {
-				c.PushSock.Close()
-				delete(js.Who, j.Submitaddr)
-			}
+	if j.Submitaddr != "" {
+		if c, found := js.Who[j.Submitaddr]; found {
+			c.Close()
+			delete(js.Who, j.Submitaddr)
 		}
 	}
 }
@@ -239,8 +256,8 @@ func (js *JobServ) FinishersToNewSocket(j *Job) []*nn.Socket {
 
 func (js *JobServ) CloseRegistry() {
 	for _, pp := range js.Who {
-		if pp.PushSock != nil {
-			pp.PushSock.Close()
+		if pp.pushSock != nil {
+			pp.Close()
 		}
 	}
 }
@@ -648,10 +665,6 @@ func (js *JobServ) Start() {
 				// wait for it, but often they will want confirmation/the jobid.
 				js.AckBack(newjob, newjob.Submitaddr, schema.JOBMSG_ACKSUBMIT, []string{})
 
-				// Generally try to not cache submitter sockets anymore, since they leak
-				// really quickly, filling up all slots in our file descriptor table.
-				js.UnRegisterSubmitter(newjob)
-
 			case resubId := <-js.ReSubmit:
 				VPrintf("  === event loop case === (%d) JobServ got resub for jobid %d\n", loopcount, resubId)
 				js.CountDeaf++
@@ -1050,7 +1063,7 @@ func (js *JobServ) SetAddrDestSocket(destAddr string, job *Job) {
 	defer js.WhoLock.RUnlock()
 	dest, ok := js.Who[destAddr]
 	if ok {
-		job.DestinationSocket = dest.PushSock
+		job.DestinationSocket = dest.DemandPushSock()
 	}
 }
 
