@@ -1178,9 +1178,10 @@ func (js *JobServ) AckBack(reqjob *Job, toaddr string, msg schema.JobMsg, out []
 			if err != nil {
 				// for now assume deaf worker
 				TSPrintf("[pid %d] AckBack with msg %s to '%s' timed-out.\n", os.Getpid(), job.Msg, addr)
-				// close socket, to try not to leak it.
-				js.UnRegisterSubmitter(&job)
 			}
+			// close socket, to try not to leak it. ofh_test (open file handles test)
+			// needs this next line or we'll see leaks.
+			js.UnRegisterSubmitter(&job)
 			return
 		}(*job, toaddr)
 	} else {
